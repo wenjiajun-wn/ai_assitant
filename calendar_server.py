@@ -416,6 +416,7 @@ body{font-family:"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;backgroun
 <div class="drop-overlay hidden-input" id="dropOverlay" style="display:none"
      ondragover="return false"
      ondragenter="showDropOverlay();return false"
+     ondragleave="hideDropOverlay();return false"
      ondrop="onDrop(event);return false">
   <div class="drop-box">
     <div class="icon">📂</div>
@@ -432,7 +433,7 @@ body{font-family:"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;backgroun
 let events = [];
 let currentDate = new Date();
 let currentView = 'month';
-let selectedDate = new Date().toISOString().slice(0,10);
+let selectedDate = fmtLocalDate(new Date());
 let miniDate = new Date();
 
 const COLORS = [
@@ -479,6 +480,7 @@ function navPrev() {
   else if (currentView === 'week') d.setDate(d.getDate() - 7);
   else d.setDate(d.getDate() - 1);
   currentDate = d; miniDate = new Date(d);
+  selectedDate = fmtLocalDate(d);
   renderAll();
 }
 
@@ -488,25 +490,27 @@ function navNext() {
   else if (currentView === 'week') d.setDate(d.getDate() + 7);
   else d.setDate(d.getDate() + 1);
   currentDate = d; miniDate = new Date(d);
+  selectedDate = fmtLocalDate(d);
   renderAll();
 }
 
 function navToday() {
   currentDate = new Date(); miniDate = new Date();
-  selectedDate = new Date().toISOString().slice(0,10);
+  selectedDate = fmtLocalDate(new Date());
   renderAll();
 }
 
 function setView(view) {
   currentView = view;
-  if (view === 'day') currentDate = new Date(selectedDate + 'T00:00:00');
+  if (view === 'day') { const [y6,m6,d6] = selectedDate.split('-'); currentDate = new Date(+y6, +m6 - 1, +d6); }
   renderAll();
 }
 
 function goToDate(dateStr) {
   selectedDate = dateStr;
-  currentDate = new Date(dateStr + 'T00:00:00');
-  miniDate = new Date(dateStr + 'T00:00:00');
+  const [gy,gm,gd] = dateStr.split('-');
+  currentDate = new Date(+gy, +gm - 1, +gd);
+  miniDate = new Date(+gy, +gm - 1, +gd);
   currentView = 'day';
   renderAll();
 }
@@ -529,6 +533,13 @@ function fmtDateFull(ds) {
   const w = new Date(y, parseInt(m)-1, parseInt(d)).getDay();
   return `${y}年${parseInt(m)}月${parseInt(d)}日 星期${DAY_NAMES[w]}`;
 }
+function fmtLocalDate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 
 // ═══════════════════════════════════════════════════════
 // Render all
@@ -538,6 +549,8 @@ function renderAll() {
   renderTitle();
   renderCalendar();
   renderDayPanel();
+  renderMiniCal();
+  renderUpcoming();
 }
 
 function renderViewTabs() {
@@ -557,20 +570,11 @@ function renderTitle() {
     document.getElementById('viewTitle').textContent =
       `${start.getFullYear()}/${start.getMonth()+1}/${start.getDate()} — ${end.getFullYear()}/${end.getMonth()+1}/${end.getDate()}`;
   } else {
-    document.getElementById('viewTitle').textContent = fmtDateFull(d.toISOString().slice(0,10));
+    document.getElementById('viewTitle').textContent = fmtDateFull(fmtLocalDate(d));
   }
 }
 
-function renderStats() {
-  const total = events.length;
-  const todayEvents = eventsOnDay(new Date().toISOString().slice(0,10)).length;
-  document.getElementById('statsBar').innerHTML = `
-    <div class="stat">📊 总事项：<b>${total}</b></div>
-    <div class="stat">📅 今日事项：<b>${todayEvents}</b></div>
-    <div class="stat">🔴 紧急：<b>${events.filter(e=>e.color==='#e74c3c').length}</b></div>
-    <div class="stat">🟡 重要：<b>${events.filter(e=>e.color==='#f39c12').length}</b></div>
-  `;
-}
+
 
 // ═══════════════════════════════════════════════════════
 // Mini Calendar (sidebar)
@@ -580,7 +584,7 @@ function renderMiniCal() {
   const firstDay = new Date(y, m, 1).getDay();
   const daysInMonth = new Date(y, m + 1, 0).getDate();
   const daysInPrev = new Date(y, m, 0).getDate();
-  const today = new Date().toISOString().slice(0,10);
+  const today = fmtLocalDate(new Date());
 
   let html = '<div class="mini-cal">';
   html += '<div class="mini-cal-header">';
@@ -609,22 +613,23 @@ function renderMiniCal() {
       if (ds === selectedDate) cls += ' selected';
       if (eventsOnDay(ds).length > 0) cls += ' has-event';
     }
-    html += `<div class="${cls}" onclick="selectDay('${ds}');currentDate=new Date('${ds}T00:00:00');miniDate=new Date('${ds}T00:00:00');renderAll()">${day}</div>`;
+    html += `<div class="${cls}" onclick="selectDay('${ds}');(function(){const p=ds.split('-');currentDate=new Date(+p[0],+p[1]-1,+p[2]);miniDate=new Date(+p[0],+p[1]-1,+p[2])})();renderAll()">${day}</div>`;
   }
   html += '</div></div>';
   document.getElementById('miniCal').innerHTML = html;
 }
 
 function formatDateStr(y, m, d) {
-  // Use local date (NOT toISOString which is UTC)
-  return `${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+  // Use Date constructor to properly handle month rollover
+  const dt = new Date(y, m, d);
+  return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
 }
 
 // ═══════════════════════════════════════════════════════
 // Upcoming events (sidebar)
 // ═══════════════════════════════════════════════════════
 function renderUpcoming() {
-  const today = new Date().toISOString().slice(0,10);
+  const today = fmtLocalDate(new Date());
   const upcoming = events
     .filter(e => e.date >= today)
     .sort((a,b) => a.date.localeCompare(b.date))
@@ -659,7 +664,7 @@ function renderMonth() {
   const firstDay = new Date(y, m, 1).getDay();
   const daysInMonth = new Date(y, m + 1, 0).getDate();
   const daysInPrev = new Date(y, m, 0).getDate();
-  const today = new Date().toISOString().slice(0,10);
+  const today = fmtLocalDate(new Date());
 
   let html = '<div class="month-grid">';
   DAY_NAMES.forEach(d => html += `<div class="month-header">${d}</div>`);
@@ -709,7 +714,7 @@ function renderWeek() {
   const start = new Date(currentDate);
   start.setDate(start.getDate() - start.getDay());
   start.setHours(0,0,0,0);
-  const today = new Date().toISOString().slice(0,10);
+  const today = fmtLocalDate(new Date());
 
   let html = '<div class="time-grid">';
 
@@ -718,9 +723,9 @@ function renderWeek() {
   html += '<div class="time-gutter"></div>';
   for (let i = 0; i < 7; i++) {
     const d = new Date(start); d.setDate(d.getDate() + i);
-    const ds = d.toISOString().slice(0,10);
+    const ds = fmtLocalDate(d);
     const isToday = ds === today;
-    html += `<div class="time-col-header${isToday ? ' today' : ''}">`;
+    html += `<div class="time-col-header${isToday ? ' today' : ''}${ds === selectedDate ? ' selected' : ''}">`;
     html += `<div style="font-size:10px;opacity:.8">${DAY_NAMES[i]}</div>`;
     html += `<div style="font-size:15px">${d.getDate()}</div>`;
     html += '</div>';
@@ -733,7 +738,7 @@ function renderWeek() {
     html += `<div class="time-label">${String(h).padStart(2,'0')}:00</div>`;
     for (let i = 0; i < 7; i++) {
       const d = new Date(start); d.setDate(d.getDate() + i);
-      const ds = d.toISOString().slice(0,10);
+      const ds = fmtLocalDate(d);
       html += `<div class="time-slot" data-date="${ds}" onclick="selectDay('${ds}')">`;
       if (h === 8) { // Show events in the 8am slot as proxies for all-day events
         const dayEvents = eventsOnDay(ds);
@@ -754,8 +759,8 @@ function renderWeek() {
 // Day View
 // ═══════════════════════════════════════════════════════
 function renderDay() {
-  const ds = currentDate.toISOString().slice(0,10);
-  const today = new Date().toISOString().slice(0,10);
+  const ds = fmtLocalDate(currentDate);
+  const today = fmtLocalDate(new Date());
   const dayEvents = eventsOnDay(ds);
 
   if (dayEvents.length === 0) {
@@ -965,9 +970,9 @@ document.addEventListener('keydown', e => {
 
 
 // ═══════════════════════════════════════════════════════
-// Auto-poll: check for new events every 5 seconds
+// Auto-poll: check for new events every 2 seconds
 // ═══════════════════════════════════════════════════════
-let lastEventHash = '';
+let lastEventHash = JSON.stringify(events);
 setInterval(async () => {
   try {
     // Check for pending todos from offline push
@@ -994,11 +999,17 @@ setInterval(async () => {
   } catch(e) { /* server not running yet — ignore */ }
 }, 2000);
 
-// Update status dot
-setInterval(() => {
+// Update status dot with real server health check
+setInterval(async () => {
   const dot = document.getElementById('statusDot');
-  if (dot) dot.style.background = dot.style.background === 'rgb(46, 204, 113)' ? '#f39c12' : '#2ecc71';
-}, 2000);
+  if (!dot) return;
+  try {
+    const res = await fetch('/api/events');
+    dot.style.background = res.ok ? '#2ecc71' : '#e74c3c';
+  } catch(e) {
+    dot.style.background = '#e74c3c';
+  }
+}, 5000);
 </script>
 
 </body>
