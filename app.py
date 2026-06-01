@@ -1,6 +1,8 @@
 import os
 import re
 import base64
+import json
+import urllib.request
 from io import BytesIO
 from datetime import datetime, timedelta, date
 
@@ -8,7 +10,25 @@ from PIL import Image
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
-from calendar_sync import add_to_calendar
+
+CALENDAR_SERVER = "http://127.0.0.1:8080"
+
+
+def push_to_calendar_server(todos):
+    """Push extracted todos directly to the calendar web server."""
+    try:
+        data = json.dumps(todos, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            f"{CALENDAR_SERVER}/api/events/batch",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result.get("created", 0), None
+    except Exception as e:
+        return 0, str(e)
 
 # ---------- helpers ----------
 
@@ -101,43 +121,13 @@ def parse_todos_from_markdown(md):
     return todos
 
 
-def sync_to_icloud(todos):
-    """Add todos to Windows Calendar via .ics auto-import. Returns (created, error)."""
-    count, err = add_to_calendar(todos)
-    if err:
-        return [], err
-    return [{"title": t["title"]} for t in todos[:count]], None
-
-
-def generate_ics(todos):
-    lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//AI TODO Helper//",
-    ]
-    for item in todos:
-        dt = item["date"].replace("-", "")
-        uid = f"{dt}-{abs(hash(item['title'])) & 0x7FFFFFFF:08x}"
-        lines += [
-            "BEGIN:VEVENT",
-            f"DTSTART;VALUE=DATE:{dt}",
-            f"DTEND;VALUE=DATE:{dt}",
-            f"SUMMARY:[{item['priority']}] {item['title']}",
-            f"DESCRIPTION:来源: {item['source']}\\\\n截止: {item['deadline']}",
-            f"UID:{uid}",
-            "END:VEVENT",
-        ]
-    lines.append("END:VCALENDAR")
-    return "\r\n".join(lines)
-
-
 # ---------- Streamlit App ----------
 
 load_dotenv()
 
 st.set_page_config(page_title="AI 待办事项提取助手", layout="centered")
 st.title("📋 AI 视觉 TODO 提取助手")
-st.write("上传一张截图，AI 将为你自动提取待办事项并导入 Windows 日历。")
+st.write("上传一张截图，AI 将自动提取待办事项并导入日历网页。")
 
 api_key = os.environ.get("DASHSCOPE_API_KEY")
 if not api_key:
@@ -147,8 +137,8 @@ if not api_key:
 # --- sidebar: Calendar settings ---
 with st.sidebar:
     st.header("📅 日历设置")
-    st.success("日历就绪 ✅")
-    st.caption("待办事项将自动导入 Outlook 日历，无需手动操作。")
+    st.success("日历网页就绪 ✅")
+    st.caption("待办事项将自动导入日历网页 http://127.0.0.1:8080，无需手动操作。")
 
 client = OpenAI(
     api_key=api_key,
@@ -168,30 +158,23 @@ if uploaded_file is not None:
 for key, default in [
     ("todos", []),
     ("ai_response", ""),
-    ("outlook_synced", False),
-    ("outlook_count", 0),
+    ("web_synced", False),
+    ("web_count", 0),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
 # --- extraction ---
 if image is not None:
-    if st.button("🚀 开始提取并同步到日历", type="primary"):
+    if st.button(" 开始提取并同步到日历", type="primary"):
         # Step 1: AI extraction
         with st.spinner("AI 正在深度分析图片，请稍候..."):
             try:
                 prompt = (
-                    "仔细查看这张截图，逐区域扫描其中的文字内容。把你看到的每一个任务、待办、提醒、"
-                    "@提及、未读消息、会议安排、截止日期、代码 TODO/FIXME 都列出来。\n\n"
-                    '重要：即使只有一条模糊的任务线索也要列出来，不要轻易判断"没有待办事项"。\n\n'
-                    "按以下格式输出：\n"
-                    "### 🔴 紧急\n"
-                    "- **任务**:xxx | **来源**:xxx | **截止**:xxx\n"
-                    "### 🟡 重要\n"
-                    "- **任务**:xxx | **来源**:xxx | **截止**:xxx\n"
-                    "### 🟢 普通\n"
-                    "- **任务**:xxx | **来源**:xxx\n\n"
-                    "只有在你逐区域扫描后、确实找不到任何文字提及任务相关内容时，才回复：'✅ 未在屏幕中发现待办事项。'\n"
+                    "用一两句话总结截图中的待办事项，控制在80字以内。"
+                    "包含：做什么事、来自哪里、截止时间。同一个日期只出现一次。"
+                    "例：需在飞书人事系统申报院外兼职，已从事的须在6月20日前主动报备（来源：人事人才部通知）。"
+                    "没有待办内容时回复「✅ 未发现」。"
                     "用中文回答。"
                 )
 
@@ -208,25 +191,45 @@ if image is not None:
                 )
 
                 raw = response.choices[0].message.content
+                print(f"\n{'='*40}\nAI 输出:\n{raw}\n{'='*40}\n")
                 st.session_state.ai_response = raw
-                st.session_state.todos = parse_todos_from_markdown(raw)
-                st.session_state.outlook_synced = False
-                st.session_state.outlook_count = 0
+                summary = raw.strip()
+                dl = date.today().isoformat()
+                patterns = [
+                    r'\d{4}[-/年]\d{1,2}[-/月]\d{1,2}日?',
+                    r'\d{1,2}月\d{1,2}日',
+                    r'今天', r'明天', r'后天', r'大后天',
+                    r'下周[一二三四五六日天]', r'周[一二三四五六日天]', r'星期[一二三四五六日天]',
+                ]
+                for pat in patterns:
+                    for m in re.findall(pat, summary):
+                        d = parse_chinese_date(m)
+                        if d > dl:
+                            dl = d
+                st.session_state.todos = [{
+                    "title": summary,
+                    "priority": "普通",
+                    "date": dl,
+                    "source": "截图上传",
+                    "deadline": summary,
+                }] if summary else []
+                st.session_state.web_synced = False
+                st.session_state.web_count = 0
 
             except Exception as e:
                 st.error(f"分析过程中出错: {e}")
                 st.stop()
 
-        # Step 2: sync to iCloud
+        # Step 2: push to calendar website
         todos = st.session_state.todos
         if todos:
-            with st.spinner("正在自动同步到 Outlook 日历..."):
-                created, err = sync_to_icloud(todos)
-                if err:
-                    st.warning(f"⚠️ 日历同步失败: {err}")
+            with st.spinner("正在自动同步到日历网页..."):
+                web_count, web_err = push_to_calendar_server(todos)
+                if web_err:
+                    st.warning(f"⚠️ 日历网站同步失败: {web_err}")
                 else:
-                    st.session_state.outlook_synced = True
-                    st.session_state.outlook_count = len(created)
+                    st.session_state.web_synced = True
+                    st.session_state.web_count = web_count
 
         st.success("✨ 提取完成！")
 
@@ -240,18 +243,10 @@ if st.session_state.ai_response:
         st.divider()
         st.subheader("📅 日历导入状态")
 
-        if st.session_state.outlook_synced:
-            st.success(f"✅ 已自动导入 {st.session_state.outlook_count} 条待办到 Outlook 日历")
+        if st.session_state.get("web_synced"):
+            st.success(f"🌐 已自动推送 {st.session_state.web_count} 条待办到日历网站")
+            st.info("📌 打开 http://127.0.0.1:8080 查看日历")
         else:
-            st.warning("⚠️ 导入未成功，可使用下方 .ics 文件手动导入")
-
-        ics_content = generate_ics(todos)
-        st.download_button(
-            label="📥 下载 .ics 日历文件（备用）",
-            data=ics_content,
-            file_name=f"todos_{datetime.now().strftime('%Y%m%d_%H%M%S')}.ics",
-            mime="text/calendar",
-        )
-        st.caption("如果自动导入失败，可下载 .ics 文件后双击手动导入。")
+            st.warning("⚠️ 同步未成功 — 请确认日历服务器已启动 (双击 run.bat)")
     else:
         st.info("没有可解析的待办事项，未执行日历同步。")

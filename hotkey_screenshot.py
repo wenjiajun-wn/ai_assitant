@@ -1,6 +1,6 @@
 """
 剪贴板监听助手 — 后台运行，自动监测截图。
-Win+Shift+S / 微信截图 / QQ截图 → AI 分析 → 自动导入 Windows 日历。
+Win+Shift+S → AI 分析 → 自动打开日历网页 → 事项已就位。
 无需登录，无需注册，即开即用。
 """
 
@@ -10,13 +10,60 @@ import re
 import hashlib
 import base64
 import time
+import json
+import webbrowser
+import urllib.request
 from io import BytesIO
 from datetime import datetime, timedelta, date
 
-from PIL import Image, ImageGrab
+from PIL import Image
 from dotenv import load_dotenv
 from openai import OpenAI
-from calendar_sync import add_to_calendar
+import keyboard
+
+CALENDAR_SERVER = "http://127.0.0.1:8080"
+PENDING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pending_todos.json")
+_browser_opened = False
+
+
+def push_to_calendar_server(todos):
+    """Push extracted todos directly to the calendar web server.
+    On failure, save to local pending file so calendar picks them up later."""
+    # Try push
+    try:
+        data = json.dumps(todos, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            f"{CALENDAR_SERVER}/api/events/batch",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result.get("created", 0), None
+    except Exception as e:
+        pass  # Will save to pending file below
+
+    # Server not reachable — save to pending file for later import
+    try:
+        existing = []
+        if os.path.exists(PENDING_FILE):
+            with open(PENDING_FILE, "r", encoding="utf-8") as f:
+                existing = json.loads(f.read())
+        existing.extend(todos)
+        with open(PENDING_FILE, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        return len(todos), f"服务器未启动，已暂存到本地，打开日历网页后自动导入"
+    except Exception as e2:
+        return 0, str(e2)
+
+
+def open_calendar():
+    """Open calendar in browser on first push only."""
+    global _browser_opened
+    if not _browser_opened:
+        webbrowser.open(CALENDAR_SERVER)
+        _browser_opened = True
 
 # ---------- helpers ----------
 
@@ -120,13 +167,33 @@ def image_hash(img):
     return hashlib.md5(img.tobytes()).hexdigest()
 
 
-# ---------- Calendar sync ----------
-# Uses local Windows Calendar via .ics auto-import — no cloud setup needed.
-
-
 # ---------- main ----------
 
+def single_instance_lock():
+    """Prevent multiple instances of this script from running (file-based lock)."""
+    import tempfile, subprocess
+    lockfile = os.path.join(tempfile.gettempdir(), "ai_todo_watcher.lock")
+    if os.path.exists(lockfile):
+        try:
+            with open(lockfile) as f:
+                old_pid = int(f.read().strip())
+            # Windows: use tasklist to check if PID exists
+            r = subprocess.run(f'tasklist /fi \"pid eq {old_pid}\" /fo csv /nh',
+                             shell=True, capture_output=True)
+            if f'"{old_pid}"' in r.stdout.decode('gbk', errors='ignore'):
+                print("⚠️ 截图监听已在运行中，请勿重复启动")
+                sys.exit(0)
+            # Stale lock
+            os.remove(lockfile)
+        except (ValueError, OSError):
+            os.remove(lockfile)
+    with open(lockfile, "w") as f:
+        f.write(str(os.getpid()))
+    return lockfile
+
+
 def main():
+    lock = single_instance_lock()
     load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
     api_key = os.environ.get("DASHSCOPE_API_KEY")
@@ -140,100 +207,94 @@ def main():
         timeout=120.0,
     )
 
-    print("🔔 AI TODO 剪贴板监听已启动")
-    print("   截图 (Win+Shift+S) → AI 分析 → 导入 Windows 日历")
-    print("   关闭此窗口即可退出")
+    # Check calendar server (should already be started by run.bat)
+    print("📅 检查日历服务器...")
+    try:
+        urllib.request.urlopen(CALENDAR_SERVER, timeout=2)
+        print(f"   日历网页就绪 → {CALENDAR_SERVER}")
+    except Exception:
+        print(f"   ⚠️ 日历服务器未启动，事项将暂存本地，打开后自动导入")
 
-    last_hash = None
+    print("🔔 截图监听已启动")
+    print("   Win+Shift+S 截图 → 自动捕获全屏 → AI 分析 → 日历")
+    print("   Ctrl+C 退出")
+
+    last_hashes = []
     processing = False
+    cooldown_until = 0
 
-    while True:
+    def process_screenshot():
+        nonlocal processing, cooldown_until
+        if processing or time.time() < cooldown_until:
+            return
+        processing = True
         try:
-            img = ImageGrab.grabclipboard()
-            if img is None or not isinstance(img, Image.Image):
-                time.sleep(1)
-                continue
-
+            time.sleep(0.5)
+            import win32clipboard
+            win32clipboard.OpenClipboard()
+            if not win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_DIB):
+                win32clipboard.CloseClipboard()
+                print("   ⚠️ 剪贴板无图片，请确认已用 Win+Shift+S 截图")
+                return
+            data = win32clipboard.GetClipboardData(win32clipboard.CF_DIB)
+            win32clipboard.CloseClipboard()
+            img = Image.open(BytesIO(data))
             h = image_hash(img)
-            if h == last_hash:
-                time.sleep(1)
-                continue
-            last_hash = h
+            key = (h, img.size[0], img.size[1])
+            if key in last_hashes:
+                return
+            last_hashes.append(key)
+            if len(last_hashes) > 10:
+                last_hashes.pop(0)
 
-            if processing:
-                continue
-            processing = True
+            print(f"\n📸 屏幕捕获 ({img.size}) — AI 分析中...")
+            img_b64 = pil_to_base64(img)
+            response = client.chat.completions.create(
+                model="qwen-vl-max",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                        {"type": "text", "text": "仔细查看这张截图，用一段简洁的话总结其中需要关注或处理的事项。控制在100字以内。用中文回答。"},
+                    ],
+                }],
+            )
+            raw = response.choices[0].message.content
+            print(f"   AI: {raw}")
+            summary = raw.strip()
+            if not summary:
+                print("   ✅ 无事项")
+                return
+            dl = date.today().isoformat()
+            for pat in [r'\d{4}[-/年]\d{1,2}[-/月]\d{1,2}日?', r'\d{1,2}月\d{1,2}日',
+                         '今天', '明天', '后天', '大后天',
+                         r'下周[一二三四五六日天]', r'周[一二三四五六日天]', r'星期[一二三四五六日天]']:
+                for m in re.findall(pat, summary):
+                    d = parse_chinese_date(m)
+                    if d > dl:
+                        dl = d
+            todos = [{"title": summary, "priority": "普通", "date": dl, "source": "截图", "deadline": summary}]
+            _, err = push_to_calendar_server(todos)
+            if err:
+                print(f"   ⚠️ 同步失败: {err}")
+            else:
+                print("   🌐 已推送到日历")
+                open_calendar()
+            notify("AI TODO 助手", summary[:60])
+        except Exception as e:
+            print(f"   ❌ 失败: {e}")
+        finally:
+            processing = False
+            cooldown_until = time.time() + 5
 
-            try:
-                print(f"\n📸 检测到新截图 ({img.size}) — 正在 AI 分析...")
-
-                prompt = (
-                    "仔细查看这张截图，逐区域扫描其中的文字内容。把你看到的每一个任务、待办、提醒、"
-                    "@提及、未读消息、会议安排、截止日期、代码 TODO/FIXME 都列出来。\n\n"
-                    '重要：即使只有一条模糊的任务线索也要列出来，不要轻易判断"没有待办事项"。\n\n'
-                    "按以下格式输出：\n"
-                    "### 🔴 紧急\n"
-                    "- **任务**:xxx | **来源**:xxx | **截止**:xxx\n"
-                    "### 🟡 重要\n"
-                    "- **任务**:xxx | **来源**:xxx | **截止**:xxx\n"
-                    "### 🟢 普通\n"
-                    "- **任务**:xxx | **来源**:xxx\n\n"
-                    "只有在你逐区域扫描后、确实找不到任何文字提及任务相关内容时，才回复：'✅ 未在屏幕中发现待办事项。'\n"
-                    "用中文回答。"
-                )
-
-                img_b64 = pil_to_base64(img)
-                response = client.chat.completions.create(
-                    model="qwen-vl-max",
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                            {"type": "text", "text": prompt},
-                        ],
-                    }],
-                )
-
-                raw = response.choices[0].message.content
-                print(f"   AI: {raw}")
-
-                todos = parse_todos_from_markdown(raw)
-
-                if not todos:
-                    print("   ✅ 未发现待办事项")
-                    notify("AI TODO 助手", "未发现待办事项")
-                    continue
-
-                # Print results
-                print(f"   共提取 {len(todos)} 条待办:")
-                for t in todos:
-                    print(f"      [{t['priority']}] {t['title']} → {t['date']}")
-
-                # Add to Windows Calendar via .ics auto-import
-                count, err = add_to_calendar(todos)
-                if err:
-                    print(f"   ⚠️ 日历导入失败: {err}")
-                else:
-                    print(f"   📅 已自动导入 {count} 条待办到 Outlook 日历")
-
-                # Notification
-                summary = "、".join([t["title"][:15] for t in todos[:3]])
-                if len(todos) > 3:
-                    summary += f" 等{len(todos)}条"
-                notify("AI TODO 助手 — 已导入", f"{summary}\n已自动导入到 Outlook 日历")
-
-            except Exception as e:
-                print(f"   ❌ 处理失败: {e}")
-                notify("AI TODO 助手 — 错误", str(e))
-                last_hash = None
-            finally:
-                processing = False
-
-        except KeyboardInterrupt:
-            print("\n👋 已退出")
-            break
-        except Exception:
-            time.sleep(1)
+    keyboard.add_hotkey('win+shift+s', process_screenshot, suppress=False)
+    try:
+        keyboard.wait()
+    except KeyboardInterrupt:
+        print("\n👋 已退出")
+    finally:
+        if os.path.exists(lock):
+            os.remove(lock)
 
 
 if __name__ == "__main__":
