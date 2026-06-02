@@ -25,17 +25,47 @@ ICS_WATCH_DIR = Path(tempfile.gettempdir())  # where AI-generated .ics files lan
 # Data layer — JSON file persistence
 # ──────────────────────────────────────────────────────────
 
-def load_events():
+def _get_user():
+    user = request.args.get("user", "").strip()
+    if not user:
+        user = "default"
+    if not re.match(r'^[a-zA-Z0-9_\-]{1,64}$', user):
+        from flask import abort as _abort
+        _abort(400, description="Invalid user name")
+    return user
+
+
+def load_all_data():
     if DATA_FILE.exists():
         try:
-            return json.loads(DATA_FILE.read_text("utf-8"))
+            raw = json.loads(DATA_FILE.read_text("utf-8"))
         except (json.JSONDecodeError, ValueError):
-            return []
-    return []
+            return {"events": {}}
+        if isinstance(raw, list):
+            migrated = {"events": {"default": raw}}
+            save_all_data(migrated)
+            return migrated
+        if not isinstance(raw, dict) or "events" not in raw:
+            return {"events": {}}
+        return raw
+    return {"events": {}}
 
 
-def save_events(events):
-    DATA_FILE.write_text(json.dumps(events, ensure_ascii=False, indent=2), "utf-8")
+def save_all_data(data):
+    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+
+
+def load_events(user_id=None):
+    data = load_all_data()
+    if user_id is None:
+        user_id = "default"
+    return data["events"].get(user_id, [])
+
+
+def save_events(user_id, events):
+    data = load_all_data()
+    data["events"][user_id] = events
+    save_all_data(data)
 
 
 # ──────────────────────────────────────────────────────────
@@ -84,7 +114,7 @@ def _uid():
     return uuid.uuid4().hex[:12]
 
 
-def import_pending_todos():
+def import_pending_todos(user_id="default"):
     """Load todos from pending_todos.json (fallback when push happens offline)."""
     if not PENDING_FILE.exists():
         return 0
@@ -92,7 +122,7 @@ def import_pending_todos():
         pending = json.loads(PENDING_FILE.read_text("utf-8"))
         if not pending:
             return 0
-        events = load_events()
+        events = load_events(user_id)
         existing = {(e["date"], e["title"]) for e in events}
         priority_colors = {"紧急": "#e74c3c", "重要": "#f39c12", "普通": "#4a90d9"}
         imported = 0
@@ -110,7 +140,7 @@ def import_pending_todos():
             })
             existing.add(key)
             imported += 1
-        save_events(events)
+        save_events(user_id, events)
         PENDING_FILE.unlink()  # Clear pending file after successful import
         return imported
     except Exception:
@@ -123,16 +153,18 @@ def import_pending_todos():
 
 @app.route("/api/events", methods=["GET"])
 def api_events():
+    user = _get_user()
     month = request.args.get("month")
     if month:
-        return jsonify([e for e in load_events() if e.get("date", "").startswith(month)])
-    return jsonify(load_events())
+        return jsonify([e for e in load_events(user) if e.get("date", "").startswith(month)])
+    return jsonify(load_events(user))
 
 
 @app.route("/api/events", methods=["POST"])
 def api_create_event():
+    user = _get_user()
     data = request.get_json()
-    events = load_events()
+    events = load_events(user)
 
     event = {
         "id": _uid(),
@@ -142,19 +174,20 @@ def api_create_event():
         "color": data.get("color", "#4a90d9"),
     }
     events.append(event)
-    save_events(events)
+    save_events(user, events)
     return jsonify(event), 201
 
 
 @app.route("/api/events/batch", methods=["POST"])
 def api_batch_create():
+    user = _get_user()
     """Batch-import todos from AI extraction. Deduplicates by date+title."""
     data = request.get_json()
     items = data if isinstance(data, list) else data.get("todos", [])
     if not items:
         return jsonify({"error": "empty batch"}), 400
 
-    events = load_events()
+    events = load_events(user)
     existing = {(e["date"], e["title"]) for e in events}
     priority_colors = {"紧急": "#e74c3c", "重要": "#f39c12", "普通": "#4a90d9"}
     created = []
@@ -175,58 +208,62 @@ def api_batch_create():
         created.append(ev)
         existing.add(key)
 
-    save_events(events)
+    save_events(user, events)
     return jsonify({"created": len(created), "events": created}), 201
 
 
 @app.route("/api/events/<eid>", methods=["PUT"])
 def api_update_event(eid):
+    user = _get_user()
     data = request.get_json()
-    events = load_events()
+    events = load_events(user)
     for ev in events:
         if ev["id"] == eid:
             ev["title"] = data.get("title", ev["title"])
             ev["date"] = data.get("date", ev["date"])
             ev["description"] = data.get("description", ev.get("description", ""))
             ev["color"] = data.get("color", ev.get("color", "#4a90d9"))
-            save_events(events)
+            save_events(user, events)
             return jsonify(ev)
     return jsonify({"error": "not found"}), 404
 
 
 @app.route("/api/events/<eid>", methods=["DELETE"])
 def api_delete_event(eid):
-    events = load_events()
+    user = _get_user()
+    events = load_events(user)
     events = [e for e in events if e["id"] != eid]
-    save_events(events)
+    save_events(user, events)
     return jsonify({"ok": True, "deleted": 1})
 
 
 @app.route("/api/events/batch", methods=["DELETE"])
 def api_delete_batch():
+    user = _get_user()
     """Delete specific events by IDs, or all if no IDs given."""
     data = request.get_json(silent=True) or {}
     ids = data.get("ids", None)
-    events = load_events()
+    events = load_events(user)
     if ids:
         events = [e for e in events if e["id"] not in ids]
-        deleted = len([e for e in load_events() if e["id"] in ids])
+        deleted = len([e for e in load_events(user) if e["id"] in ids])
     else:
         deleted = len(events)
         events = []
-    save_events(events)
+    save_events(user, events)
     return jsonify({"ok": True, "deleted": deleted})
 
 
 @app.route("/api/import/ics", methods=["POST"])
 def api_import_ics():
+    user = _get_user()
     """Import events from uploaded .ics file(s)."""
     imported = []
     files = request.files.getlist("files")
     if not files:
         return jsonify({"error": "no files"}), 400
 
-    events = load_events()
+    events = load_events(user)
     existing_dates = {(e["date"], e["title"]) for e in events}
 
     for f in files:
@@ -239,12 +276,13 @@ def api_import_ics():
                     imported.append(parsed)
                     existing_dates.add(key)
 
-    save_events(events)
+    save_events(user, events)
     return jsonify({"imported": len(imported), "events": imported})
 
 
 @app.route("/api/pending/import", methods=["POST"])
 def api_import_pending():
+    user = _get_user()
     """Import todos from pending_todos.json (offline fallback)."""
     count = import_pending_todos()
     return jsonify({"imported": count})
@@ -252,9 +290,10 @@ def api_import_pending():
 
 @app.route("/api/scan-temp", methods=["POST"])
 def api_scan_temp():
+    user = _get_user()
     """Scan temp directory for AI-generated .ics files and auto-import them."""
     imported = []
-    events = load_events()
+    events = load_events(user)
     existing = {(e["date"], e["title"]) for e in events}
 
     try:
@@ -272,7 +311,7 @@ def api_scan_temp():
             except OSError:
                 pass
 
-        save_events(events)
+        save_events(user, events)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -430,6 +469,7 @@ body{font-family:"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;backgroun
 // ═══════════════════════════════════════════════════════
 // State
 // ═══════════════════════════════════════════════════════
+const USER_ID = new URLSearchParams(window.location.search).get('user') || 'default';
 let events = [];
 let currentDate = new Date();
 let currentView = 'month';
@@ -457,9 +497,10 @@ async function init() {
   renderAll();
 }
 init();
+document.title = '📅 ' + USER_ID + ' - AI TODO';
 
 async function fetchEvents() {
-  try { const res = await fetch('/api/events'); events = await res.json(); }
+  try { const res = await fetch('/api/events?user=' + USER_ID); events = await res.json(); }
   catch(e) { events = []; }
 }
 
@@ -848,7 +889,7 @@ async function batchDelete() {
   const ids = [...document.querySelectorAll('.event-check:checked')].map(cb => cb.dataset.id);
   if (ids.length === 0) return;
   if (!confirm(`确认删除选中的 ${ids.length} 条事项？`)) return;
-  await fetch('/api/events/batch', {
+  await fetch('/api/events/batch?user=' + USER_ID, {
     method: 'DELETE',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({ids})
@@ -877,7 +918,7 @@ async function cycleColor(eid, dot) {
   // Update sidebar label
   const label = dot.nextElementSibling?.nextElementSibling?.querySelector('.priority-label');
   if (label) label.textContent = next.label;
-  await fetch(`/api/events/${eid}`, {
+  await fetch(`/api/events/${eid}?user=${USER_ID}`, {
     method: 'PUT',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({color: next.color, title: ev.title, date: ev.date, description: ev.description || ''})
@@ -889,7 +930,7 @@ async function deleteEvent(eid) {
   if (!eid) return;
   if (!confirm('确认删除此事件？')) return;
   try {
-    await fetch(`/api/events/${eid}`, { method: 'DELETE' });
+    await fetch(`/api/events/${eid}?user=${USER_ID}`, { method: 'DELETE' });
     toast('🗑 事件已删除');
     await fetchEvents();
     renderAll();
@@ -920,7 +961,7 @@ async function importIcs(fileList) {
   if (count === 0) { toast('⚠️ 请选择 .ics 文件'); return; }
 
   try {
-    const res = await fetch('/api/import/ics', { method: 'POST', body: form });
+    const res = await fetch('/api/import/ics?user=' + USER_ID, { method: 'POST', body: form });
     const data = await res.json();
     if (data.imported > 0) {
       toast(`✅ 成功导入 ${data.imported} 条事件`);
@@ -938,7 +979,7 @@ async function importIcs(fileList) {
 async function scanTempDir() {
   toast('🔍 正在扫描 AI 生成的待办事项...');
   try {
-    const res = await fetch('/api/scan-temp', { method: 'POST' });
+    const res = await fetch('/api/scan-temp?user=' + USER_ID, { method: 'POST' });
     const data = await res.json();
     if (data.error) { toast('⚠️ ' + data.error); return; }
     if (data.imported > 0) {
@@ -976,8 +1017,8 @@ let lastEventHash = JSON.stringify(events);
 setInterval(async () => {
   try {
     // Check for pending todos from offline push
-    await fetch('/api/pending/import', { method: 'POST' });
-    const res = await fetch('/api/events');
+    await fetch('/api/pending/import?user=' + USER_ID, { method: 'POST' });
+    const res = await fetch('/api/events?user=' + USER_ID);
     const latest = await res.json();
     const hash = JSON.stringify(latest);
     if (hash !== lastEventHash) {
@@ -1004,7 +1045,7 @@ setInterval(async () => {
   const dot = document.getElementById('statusDot');
   if (!dot) return;
   try {
-    const res = await fetch('/api/events');
+    const res = await fetch('/api/events?user=' + USER_ID);
     dot.style.background = res.ok ? '#2ecc71' : '#e74c3c';
   } catch(e) {
     dot.style.background = '#e74c3c';
@@ -1018,6 +1059,7 @@ setInterval(async () => {
 
 @app.route("/")
 def index():
+    user = _get_user()
     return HTML
 
 

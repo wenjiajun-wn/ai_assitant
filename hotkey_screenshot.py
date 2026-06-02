@@ -21,8 +21,36 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import keyboard
 
-CALENDAR_SERVER = "http://127.0.0.1:8080"
-PENDING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pending_todos.json")
+
+# ── 多用户配置：从 user_config.json 读取用户名和服务器地址 ──
+def get_base_dir():
+    """获取 exe 或脚本所在目录（兼容 PyInstaller 打包）"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+BASE_DIR = get_base_dir()
+
+def load_user_config():
+    """从 user_config.json 读取用户配置"""
+    config_path = os.path.join(BASE_DIR, "user_config.json")
+    defaults = {
+        "user_id": "default",
+        "server_url": "http://47.84.108.154:8080"
+    }
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            defaults.update(cfg)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return defaults
+
+USER_CONFIG = load_user_config()
+USER_ID = USER_CONFIG["user_id"]
+CALENDAR_SERVER = USER_CONFIG["server_url"]
+PENDING_FILE = os.path.join(BASE_DIR, "pending_todos.json")
 _browser_opened = False
 
 
@@ -33,7 +61,7 @@ def push_to_calendar_server(todos):
     try:
         data = json.dumps(todos, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
-            f"{CALENDAR_SERVER}/api/events/batch",
+            f"{CALENDAR_SERVER}/api/events/batch?user={USER_ID}",
             data=data,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -62,7 +90,7 @@ def open_calendar():
     """Open calendar in browser on first push only."""
     global _browser_opened
     if not _browser_opened:
-        webbrowser.open(CALENDAR_SERVER)
+        webbrowser.open(f"{CALENDAR_SERVER}/?user={USER_ID}")
         _browser_opened = True
 
 # ---------- helpers ----------
@@ -194,7 +222,7 @@ def single_instance_lock():
 
 def main():
     lock = single_instance_lock()
-    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    load_dotenv(os.path.join(BASE_DIR, ".env"))
 
     api_key = os.environ.get("DASHSCOPE_API_KEY")
     if not api_key:
@@ -210,7 +238,7 @@ def main():
     # Check calendar server (should already be started by run.bat)
     print("📅 检查日历服务器...")
     try:
-        urllib.request.urlopen(CALENDAR_SERVER, timeout=2)
+        urllib.request.urlopen(f"{CALENDAR_SERVER}/api/events?user={USER_ID}", timeout=2)
         print(f"   日历网页就绪 → {CALENDAR_SERVER}")
     except Exception:
         print(f"   ⚠️ 日历服务器未启动，事项将暂存本地，打开后自动导入")
