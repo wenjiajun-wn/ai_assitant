@@ -49,27 +49,27 @@ def load_user_config():
 
     if not defaults.get("api_token"):
         server = defaults["server_url"]
-        print("\n" + "=" * 50)
-        print("  Welcome to AI TODO Assistant!")
-        print("  Open {} to register if needed".format(server + "/login"))
-        print("=" * 50)
-        email = input("  Email: ").strip().lower()
-        password = input("  Password: ").strip()
+        print("\n  Welcome to AI TODO Assistant!")
+        print("  Opening browser for one-time setup...")
+        print("  Register or login on the webpage to complete setup.")
+        webbrowser.open(server + "/login")
 
-        if email and password:
-            token = _try_login(server, email, password)
-            if not token:
-                # Register new account
-                print("  Account not found, registering...")
-                token = _try_register(server, email, password)
-            if token:
-                defaults["api_token"] = token
-                defaults["user_id"] = email
-                with open(config_path, "w", encoding="utf-8") as f:
-                    json.dump(defaults, f, ensure_ascii=False, indent=2)
-                print("  Setup complete! Starting...\n")
-            else:
-                print("  Failed to setup account. Please try again.\n")
+        # Wait for the webpage to save config (poll up to 2 minutes)
+        for _ in range(240):
+            time.sleep(0.5)
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    if cfg.get("api_token"):
+                        defaults.update(cfg)
+                        print("  Setup complete! Starting...\n")
+                        break
+                except Exception:
+                    pass
+        else:
+            print("  Timed out waiting for setup. Please run again.")
+            sys.exit(1)
 
     return defaults
 
@@ -302,7 +302,7 @@ def main():
     except Exception:
         print(f"   ⚠️ 日历服务器未启动，事项将暂存本地，打开后自动导入")
 
-    print("🔔 截图监听已启动")
+    print("🔔 截图监听已启动（轮询剪贴板模式，无需管理员权限）")
     print("   Win+Shift+S 截图 → 自动捕获全屏 → AI 分析 → 日历")
     print("   Ctrl+C 退出")
 

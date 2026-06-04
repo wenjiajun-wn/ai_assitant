@@ -176,6 +176,26 @@ def api_me():
     return jsonify({'logged_in': True, 'email': user})
 
 
+@app.route('/api/auth/save-config', methods=['POST'])
+def api_save_config():
+    """Save user_config.json for the desktop app (same machine only)."""
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': 'Please login first'}), 401
+    data = request.get_json() or {}
+    if not data.get('api_token'):
+        return jsonify({'error': 'Missing api_token'}), 400
+    config = {
+        "user_id": user,
+        "server_url": request.host_url.rstrip('/'),
+        "api_token": data['api_token']
+    }
+    # Save next to this script (the exe runs from the same dir)
+    config_path = Path(__file__).parent / "user_config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), "utf-8")
+    return jsonify({'ok': True, 'saved_to': str(config_path)})
+
+
 # ──────────────────────────────────────────────────────────
 # Events API routes
 # ──────────────────────────────────────────────────────────
@@ -413,8 +433,8 @@ function switchTab(t) {
   document.getElementById('tabRegister').classList.toggle('active', t==='register');
   document.getElementById('loginForm').style.display = t==='login'?'':'none';
   document.getElementById('registerForm').style.display = t==='register'?'':'none';
-  document.getElementById('tokenBox').style.display = 'none';
   document.getElementById('errorMsg').textContent = '';
+  document.getElementById('errorMsg').style.color = '#e74c3c';
 }
 
 async function doLogin() {
@@ -423,6 +443,7 @@ async function doLogin() {
   if (!u || !p) { document.getElementById('errorMsg').textContent = 'Enter email and password'; return; }
   const r = await api('/api/auth/login', {email:u, password:p});
   if (!r.ok) { document.getElementById('errorMsg').textContent = r.error; return; }
+  await fetch('/api/auth/save-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_token:r.api_token})});
   window.location.href = '/';
 }
 
@@ -432,11 +453,13 @@ async function doRegister() {
   if (!u || !p) { document.getElementById('errorMsg').textContent = 'Enter email and password'; return; }
   const r = await api('/api/auth/register', {email:u, password:p});
   if (!r.ok) { document.getElementById('errorMsg').textContent = r.error; return; }
+  await fetch('/api/auth/save-config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_token:r.api_token})});
   document.getElementById('tokenText').textContent = r.api_token;
   document.getElementById('tokenBox').style.display = '';
-  document.getElementById('errorMsg').textContent = 'Registration successful! Copy the API Token above.';
-  switchTab('login');
+  document.getElementById('errorMsg').style.color = '#16a34a';
+  document.getElementById('errorMsg').textContent = 'Registration successful! Copy the API Token above, then login.';
   document.getElementById('loginUser').value = u;
+  document.getElementById('loginPass').value = '';
   document.getElementById('loginPass').focus();
 }
 </script>
@@ -495,9 +518,9 @@ body{font-family:"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;backgroun
 .time-col-header.today{background:#764ba2}
 .time-row{display:flex;background:var(--surface);gap:1px}
 .time-label{width:50px;flex-shrink:0;font-size:10px;color:var(--text-secondary);text-align:right;padding:1px 6px 0 0}
-.time-slot{flex:1;min-height:36px;padding:1px 3px;cursor:pointer}
+.time-slot{flex:1;min-height:36px;padding:1px 3px;cursor:pointer;overflow:hidden}
 .time-slot:hover{background:#fafaff}
-.time-event{font-size:10px;padding:2px 5px;border-radius:3px;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1px;font-weight:500}
+.time-event{font-size:10px;padding:2px 5px;border-radius:3px;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1px;font-weight:500;max-width:100%}
 
 /* ── Day View ── */
 .day-event-card{display:flex;align-items:center;gap:10px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px;transition:box-shadow .15s}
@@ -902,11 +925,13 @@ function renderWeek() {
       const d = new Date(start); d.setDate(d.getDate() + i);
       const ds = fmtLocalDate(d);
       html += `<div class="time-slot" data-date="${ds}" onclick="selectDay('${ds}')">`;
-      if (h === 8) { // Show events in the 8am slot as proxies for all-day events
+      if (h === 8) {
         const dayEvents = eventsOnDay(ds);
-        dayEvents.forEach(e => {
-          html += `<div class="time-event" style="background:${e.color||'#5b6abf'}" style="cursor:default">${e.title}</div>`;
-        });
+        if (dayEvents.length === 1) {
+          html += `<div class="time-event" style="background:${dayEvents[0].color||'#5b6abf'}">${dayEvents[0].title}</div>`;
+        } else if (dayEvents.length > 1) {
+          html += `<div class="time-event" style="background:#5b6abf;cursor:pointer" onclick="event.stopPropagation();goToDate('${ds}')">📋 ${dayEvents.length} 项</div>`;
+        }
       }
       html += '</div>';
     }
