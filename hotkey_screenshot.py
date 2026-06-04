@@ -32,11 +32,12 @@ def get_base_dir():
 BASE_DIR = get_base_dir()
 
 def load_user_config():
-    """从 user_config.json 读取用户配置"""
+    """读取配置，无 Token 时自动引导登录/注册。"""
     config_path = os.path.join(BASE_DIR, "user_config.json")
     defaults = {
         "user_id": "default",
-        "server_url": "http://47.84.108.154:8080"
+        "server_url": "http://47.84.108.154:8080",
+        "api_token": ""
     }
     if os.path.exists(config_path):
         try:
@@ -45,10 +46,66 @@ def load_user_config():
             defaults.update(cfg)
         except (json.JSONDecodeError, ValueError):
             pass
+
+    if not defaults.get("api_token"):
+        server = defaults["server_url"]
+        print("\n" + "=" * 50)
+        print("  Welcome to AI TODO Assistant!")
+        print("  Open {} to register if needed".format(server + "/login"))
+        print("=" * 50)
+        email = input("  Email: ").strip().lower()
+        password = input("  Password: ").strip()
+
+        if email and password:
+            token = _try_login(server, email, password)
+            if not token:
+                # Register new account
+                print("  Account not found, registering...")
+                token = _try_register(server, email, password)
+            if token:
+                defaults["api_token"] = token
+                defaults["user_id"] = email
+                with open(config_path, "w", encoding="utf-8") as f:
+                    json.dump(defaults, f, ensure_ascii=False, indent=2)
+                print("  Setup complete! Starting...\n")
+            else:
+                print("  Failed to setup account. Please try again.\n")
+
     return defaults
+
+
+def _call_api(server, path, data):
+    """Helper: POST JSON to server, return parsed response."""
+    req = urllib.request.Request(
+        server + path,
+        data=json.dumps(data).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _try_login(server, email, password):
+    try:
+        r = _call_api(server, "/api/auth/login", {"email": email, "password": password})
+        return r.get("api_token") if r.get("ok") else None
+    except Exception:
+        return None
+
+
+def _try_register(server, email, password):
+    try:
+        r = _call_api(server, "/api/auth/register", {"email": email, "password": password})
+        if r.get("ok") and r.get("api_token"):
+            return r["api_token"]
+        return None
+    except Exception:
+        return None
 
 USER_CONFIG = load_user_config()
 USER_ID = USER_CONFIG["user_id"]
+API_TOKEN = USER_CONFIG["api_token"]
 CALENDAR_SERVER = USER_CONFIG["server_url"]
 PENDING_FILE = os.path.join(BASE_DIR, "pending_todos.json")
 _browser_opened = False
@@ -61,9 +118,9 @@ def push_to_calendar_server(todos):
     try:
         data = json.dumps(todos, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
-            f"{CALENDAR_SERVER}/api/events/batch?user={USER_ID}",
+            f"{CALENDAR_SERVER}/api/events/batch",
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-API-Token": API_TOKEN},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -90,7 +147,7 @@ def open_calendar():
     """Open calendar in browser on first push only."""
     global _browser_opened
     if not _browser_opened:
-        webbrowser.open(f"{CALENDAR_SERVER}/?user={USER_ID}")
+        webbrowser.open(f"{CALENDAR_SERVER}/login")
         _browser_opened = True
 
 # ---------- helpers ----------
@@ -238,7 +295,9 @@ def main():
     # Check calendar server (should already be started by run.bat)
     print("📅 检查日历服务器...")
     try:
-        urllib.request.urlopen(f"{CALENDAR_SERVER}/api/events?user={USER_ID}", timeout=2)
+        urllib.request.urlopen(
+            urllib.request.Request(f"{CALENDAR_SERVER}/api/events",
+                                   headers={"X-API-Token": API_TOKEN}), timeout=2)
         print(f"   日历网页就绪 → {CALENDAR_SERVER}")
     except Exception:
         print(f"   ⚠️ 日历服务器未启动，事项将暂存本地，打开后自动导入")

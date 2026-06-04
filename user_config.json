@@ -1,4 +1,5 @@
 {
   "user_id": "你的用户名",
-  "server_url": "http://47.84.108.154:8080"
+  "server_url": "http://47.84.108.154:8080",
+  "api_token": "注册后获取的API Token"
 }

@@ -12,19 +12,18 @@ import tempfile
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, session, redirect
+from database import (init_db, load_events, save_events, hash_password,
+                      get_user_by_token, verify_password, create_user)
 
 app = Flask(__name__, static_folder=None)
 
-DATA_FILE = Path(__file__).parent / "calendar_data.json"
-PENDING_FILE = Path(__file__).parent / "pending_todos.json"
+app.secret_key = os.environ.get("SECRET_KEY", __import__("secrets").token_hex(32))
+PENDING_FILE = Path(__file__).parent / "data" / "pending_todos.json"
 ICS_WATCH_DIR = Path(tempfile.gettempdir())  # where AI-generated .ics files land
 
 
 # ──────────────────────────────────────────────────────────
-# Data layer — JSON file persistence
-# ──────────────────────────────────────────────────────────
-
 def _get_user():
     user = request.args.get("user", "").strip()
     if not user:
@@ -35,40 +34,23 @@ def _get_user():
     return user
 
 
-def load_all_data():
-    if DATA_FILE.exists():
-        try:
-            raw = json.loads(DATA_FILE.read_text("utf-8"))
-        except (json.JSONDecodeError, ValueError):
-            return {"events": {}}
-        if isinstance(raw, list):
-            migrated = {"events": {"default": raw}}
-            save_all_data(migrated)
-            return migrated
-        if not isinstance(raw, dict) or "events" not in raw:
-            return {"events": {}}
-        return raw
-    return {"events": {}}
+def _get_current_user():
+    if 'user' in session:
+        return session['user']
+    token = request.headers.get('X-API-Token', '')
+    if token:
+        return get_user_by_token(token)
+    return None
 
 
-def save_all_data(data):
-    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), "utf-8")
+def _require_user():
+    user = _get_current_user()
+    if not user:
+        from flask import abort as _abort
+        _abort(401, description='Please login first')
+    return user
 
 
-def load_events(user_id=None):
-    data = load_all_data()
-    if user_id is None:
-        user_id = "default"
-    return data["events"].get(user_id, [])
-
-
-def save_events(user_id, events):
-    data = load_all_data()
-    data["events"][user_id] = events
-    save_all_data(data)
-
-
-# ──────────────────────────────────────────────────────────
 # ICS parser
 # ──────────────────────────────────────────────────────────
 
@@ -148,12 +130,59 @@ def import_pending_todos(user_id="default"):
 
 
 # ──────────────────────────────────────────────────────────
-# API routes
+# Auth API routes
+# ──────────────────────────────────────────────────────────
+
+@app.route('/api/auth/register', methods=['POST'])
+def api_register():
+    data = request.get_json() or {}
+    email = (data.get('email') or '').strip().lower()
+    password = (data.get('password') or '').strip()
+    if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+        return jsonify({'error': 'Please enter a valid email'}), 400
+    if len(password) < 4:
+        return jsonify({'error': 'Password at least 4 chars'}), 400
+    token = create_user(email, password)
+    if not token:
+        return jsonify({'error': 'Email already registered or invalid'}), 409
+    return jsonify({'ok': True, 'email': email, 'api_token': token}), 201
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def api_login():
+    data = request.get_json() or {}
+    email = (data.get('email') or '').strip().lower()
+    password = (data.get('password') or '').strip()
+    status, token = verify_password(email, password)
+    if status == "no_user":
+        return jsonify({'error': 'Account not found'}), 401
+    if status == "wrong_pw":
+        return jsonify({'error': 'Incorrect password'}), 401
+    session['user'] = email
+    return jsonify({'ok': True, 'email': email, 'api_token': token})
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+def api_logout():
+    session.pop('user', None)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/auth/me', methods=['GET'])
+def api_me():
+    user = _get_current_user()
+    if not user:
+        return jsonify({'logged_in': False})
+    return jsonify({'logged_in': True, 'email': user})
+
+
+# ──────────────────────────────────────────────────────────
+# Events API routes
 # ──────────────────────────────────────────────────────────
 
 @app.route("/api/events", methods=["GET"])
 def api_events():
-    user = _get_user()
+    user = _require_user()
     month = request.args.get("month")
     if month:
         return jsonify([e for e in load_events(user) if e.get("date", "").startswith(month)])
@@ -162,7 +191,7 @@ def api_events():
 
 @app.route("/api/events", methods=["POST"])
 def api_create_event():
-    user = _get_user()
+    user = _require_user()
     data = request.get_json()
     events = load_events(user)
 
@@ -180,7 +209,7 @@ def api_create_event():
 
 @app.route("/api/events/batch", methods=["POST"])
 def api_batch_create():
-    user = _get_user()
+    user = _require_user()
     """Batch-import todos from AI extraction. Deduplicates by date+title."""
     data = request.get_json()
     items = data if isinstance(data, list) else data.get("todos", [])
@@ -214,7 +243,7 @@ def api_batch_create():
 
 @app.route("/api/events/<eid>", methods=["PUT"])
 def api_update_event(eid):
-    user = _get_user()
+    user = _require_user()
     data = request.get_json()
     events = load_events(user)
     for ev in events:
@@ -230,7 +259,7 @@ def api_update_event(eid):
 
 @app.route("/api/events/<eid>", methods=["DELETE"])
 def api_delete_event(eid):
-    user = _get_user()
+    user = _require_user()
     events = load_events(user)
     events = [e for e in events if e["id"] != eid]
     save_events(user, events)
@@ -239,7 +268,7 @@ def api_delete_event(eid):
 
 @app.route("/api/events/batch", methods=["DELETE"])
 def api_delete_batch():
-    user = _get_user()
+    user = _require_user()
     """Delete specific events by IDs, or all if no IDs given."""
     data = request.get_json(silent=True) or {}
     ids = data.get("ids", None)
@@ -256,7 +285,7 @@ def api_delete_batch():
 
 @app.route("/api/import/ics", methods=["POST"])
 def api_import_ics():
-    user = _get_user()
+    user = _require_user()
     """Import events from uploaded .ics file(s)."""
     imported = []
     files = request.files.getlist("files")
@@ -282,7 +311,7 @@ def api_import_ics():
 
 @app.route("/api/pending/import", methods=["POST"])
 def api_import_pending():
-    user = _get_user()
+    user = _require_user()
     """Import todos from pending_todos.json (offline fallback)."""
     count = import_pending_todos()
     return jsonify({"imported": count})
@@ -290,7 +319,7 @@ def api_import_pending():
 
 @app.route("/api/scan-temp", methods=["POST"])
 def api_scan_temp():
-    user = _get_user()
+    user = _require_user()
     """Scan temp directory for AI-generated .ics files and auto-import them."""
     imported = []
     events = load_events(user)
@@ -322,12 +351,105 @@ def api_scan_temp():
 # Frontend — single HTML page
 # ──────────────────────────────────────────────────────────
 
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login - AI TODO</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Segoe UI","Microsoft YaHei",sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{background:#fff;border-radius:16px;padding:40px;width:360px;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.card h1{text-align:center;font-size:24px;margin-bottom:8px;color:#1a1a2e}
+.card .sub{text-align:center;font-size:13px;color:#6b7280;margin-bottom:28px}
+.form-group{margin-bottom:16px}
+.form-group label{display:block;font-size:13px;font-weight:600;margin-bottom:4px;color:#374151}
+.form-group input{width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;font-family:inherit;transition:border .15s}
+.form-group input:focus{outline:none;border-color:#667eea;box-shadow:0 0 0 3px rgba(102,126,234,.15)}
+.btn{width:100%;padding:10px;border:none;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit}
+.btn-primary{background:#667eea;color:#fff;margin-top:8px}
+.btn-primary:hover{background:#5a6fd6}
+#errorMsg{color:#e74c3c;font-size:12px;text-align:center;margin-top:12px;min-height:18px}
+.tabs{display:flex;border-bottom:1px solid #e5e7eb;margin-bottom:20px}
+.tab{flex:1;text-align:center;padding:10px;cursor:pointer;font-size:14px;font-weight:500;color:#6b7280;border-bottom:2px solid transparent;transition:.15s}
+.tab.active{color:#667eea;border-bottom-color:#667eea}
+.token-box{background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:12px;margin-top:12px;display:none}
+.token-box code{font-size:11px;word-break:break-all;color:#166534}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>&#x1f4c5; AI TODO</h1>
+  <p class="sub">Screenshot AI &middot; Smart Calendar</p>
+  <div class="tabs">
+    <div class="tab active" id="tabLogin" onclick="switchTab('login')">Login</div>
+    <div class="tab" id="tabRegister" onclick="switchTab('register')">Register</div>
+  </div>
+  <div id="loginForm">
+    <div class="form-group"><label>Email</label><input id="loginUser" type="email" placeholder="Enter email" autofocus></div>
+    <div class="form-group"><label>Password</label><input id="loginPass" type="password" placeholder="Enter password" onkeydown="if(event.key==='Enter')doLogin()"></div>
+    <button class="btn btn-primary" onclick="doLogin()">Login</button>
+  </div>
+  <div id="registerForm" style="display:none">
+    <div class="form-group"><label>Email</label><input id="regUser" type="email" placeholder="Enter email"></div>
+    <div class="form-group"><label>Password</label><input id="regPass" type="password" placeholder="At least 4 chars" onkeydown="if(event.key==='Enter')doRegister()"></div>
+    <button class="btn btn-primary" onclick="doRegister()">Register</button>
+  </div>
+  <div id="tokenBox" class="token-box">
+    <strong>&#x1f511; Your API Token (save this!):</strong><br>
+    <code id="tokenText"></code>
+    <p style="font-size:11px;color:#15803d;margin-top:4px">Copy into user_config.json to use the desktop app.</p>
+  </div>
+  <div id="errorMsg"></div>
+</div>
+<script>
+let mode = 'login';
+const api = (url, body) => fetch(url, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r => r.json().then(d => ({ok:r.ok, ...d})));
+
+function switchTab(t) {
+  mode = t;
+  document.getElementById('tabLogin').classList.toggle('active', t==='login');
+  document.getElementById('tabRegister').classList.toggle('active', t==='register');
+  document.getElementById('loginForm').style.display = t==='login'?'':'none';
+  document.getElementById('registerForm').style.display = t==='register'?'':'none';
+  document.getElementById('tokenBox').style.display = 'none';
+  document.getElementById('errorMsg').textContent = '';
+}
+
+async function doLogin() {
+  const u = document.getElementById('loginUser').value.trim();
+  const p = document.getElementById('loginPass').value.trim();
+  if (!u || !p) { document.getElementById('errorMsg').textContent = 'Enter email and password'; return; }
+  const r = await api('/api/auth/login', {email:u, password:p});
+  if (!r.ok) { document.getElementById('errorMsg').textContent = r.error; return; }
+  window.location.href = '/';
+}
+
+async function doRegister() {
+  const u = document.getElementById('regUser').value.trim();
+  const p = document.getElementById('regPass').value.trim();
+  if (!u || !p) { document.getElementById('errorMsg').textContent = 'Enter email and password'; return; }
+  const r = await api('/api/auth/register', {email:u, password:p});
+  if (!r.ok) { document.getElementById('errorMsg').textContent = r.error; return; }
+  document.getElementById('tokenText').textContent = r.api_token;
+  document.getElementById('tokenBox').style.display = '';
+  document.getElementById('errorMsg').textContent = 'Registration successful! Copy the API Token above.';
+  switchTab('login');
+  document.getElementById('loginUser').value = u;
+  document.getElementById('loginPass').focus();
+}
+</script>
+</body>
+</html>"""
+
+
 HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>📅 AI TODO 日历</title>
+<title>assitant</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -614,7 +736,6 @@ function renderTitle() {
     document.getElementById('viewTitle').textContent = fmtDateFull(fmtLocalDate(d));
   }
 }
-
 
 
 // ═══════════════════════════════════════════════════════
@@ -1059,11 +1180,25 @@ setInterval(async () => {
 
 @app.route("/")
 def index():
-    user = _get_user()
+    if 'user' not in session:
+        return redirect('/login')
     return HTML
 
 
+@app.route("/login")
+def login_page():
+    return LOGIN_HTML
+
+
+@app.route("/logout")
+def logout():
+    session.pop('user', None)
+    return redirect('/login')
+
+
 if __name__ == "__main__":
+    init_db()
+
     # Import any pending todos that were saved while server was offline
     imported = import_pending_todos()
     if imported:
