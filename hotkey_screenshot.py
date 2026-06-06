@@ -7,19 +7,24 @@ Win+Shift+S → AI 分析 → 自动打开日历网页 → 事项已就位。
 import os
 import sys
 import re
+import platform
 import hashlib
 import base64
 import time
 import json
 import webbrowser
+import tempfile
+import subprocess
 import urllib.request
 from io import BytesIO
 from datetime import datetime, timedelta, date
 
-from PIL import Image
+from PIL import Image, ImageGrab
 from dotenv import load_dotenv
 from openai import OpenAI
-import keyboard
+
+IS_MAC = platform.system() == "Darwin"
+IS_WIN = platform.system() == "Windows"
 
 
 # ── 多用户配置：从 user_config.json 读取用户名和服务器地址 ──
@@ -242,8 +247,15 @@ def parse_todos_from_markdown(md):
 
 def notify(title, message):
     try:
-        from win10toast import ToastNotifier
-        ToastNotifier().show_toast(title, message, duration=5, threaded=True)
+        if IS_MAC:
+            subprocess.run(['osascript', '-e',
+                f'display notification "{message}" with title "{title}"'],
+                capture_output=True, timeout=5)
+        elif IS_WIN:
+            from win10toast import ToastNotifier
+            ToastNotifier().show_toast(title, message, duration=5, threaded=True)
+        else:
+            print(f"[{title}] {message}")
     except Exception:
         print(f"[{title}] {message}")
 
@@ -255,23 +267,22 @@ def image_hash(img):
 # ---------- main ----------
 
 def single_instance_lock():
-    """Prevent multiple instances of this script from running (file-based lock)."""
-    import tempfile, subprocess
+    """Prevent multiple instances (cross-platform PID file lock)."""
     lockfile = os.path.join(tempfile.gettempdir(), "ai_todo_watcher.lock")
     if os.path.exists(lockfile):
         try:
             with open(lockfile) as f:
                 old_pid = int(f.read().strip())
-            # Windows: use tasklist to check if PID exists
-            r = subprocess.run(f'tasklist /fi \"pid eq {old_pid}\" /fo csv /nh',
-                             shell=True, capture_output=True)
-            if f'"{old_pid}"' in r.stdout.decode('gbk', errors='ignore'):
-                print("⚠️ 截图监听已在运行中，请勿重复启动")
-                sys.exit(0)
-            # Stale lock
-            os.remove(lockfile)
-        except (ValueError, OSError):
-            os.remove(lockfile)
+            # os.kill(pid, 0) signals nothing, just checks if process exists
+            os.kill(old_pid, 0)
+            print("⚠️ 截图监听已在运行中，请勿重复启动")
+            sys.exit(0)
+        except (ProcessLookupError, OSError, ValueError):
+            # Process not found → stale lock, remove it
+            try:
+                os.remove(lockfile)
+            except OSError:
+                pass
     with open(lockfile, "w") as f:
         f.write(str(os.getpid()))
     return lockfile
@@ -310,22 +321,12 @@ def main():
     processing = False
     cooldown_until = 0
 
-    def process_screenshot():
+    def process_screenshot(img):
         nonlocal processing, cooldown_until
         if processing or time.time() < cooldown_until:
             return
         processing = True
         try:
-            time.sleep(0.5)
-            import win32clipboard
-            win32clipboard.OpenClipboard()
-            if not win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_DIB):
-                win32clipboard.CloseClipboard()
-                print("   ⚠️ 剪贴板无图片，请确认已用 Win+Shift+S 截图")
-                return
-            data = win32clipboard.GetClipboardData(win32clipboard.CF_DIB)
-            win32clipboard.CloseClipboard()
-            img = Image.open(BytesIO(data))
             h = image_hash(img)
             key = (h, img.size[0], img.size[1])
             if key in last_hashes:
@@ -374,9 +375,17 @@ def main():
             processing = False
             cooldown_until = time.time() + 5
 
-    keyboard.add_hotkey('win+shift+s', process_screenshot, suppress=False)
+    # Clipboard polling loop (cross-platform, no admin required)
+    print(f"   平台: {'macOS' if IS_MAC else 'Windows'}")
     try:
-        keyboard.wait()
+        while True:
+            time.sleep(0.5)
+            try:
+                img = ImageGrab.grabclipboard()
+                if img and isinstance(img, Image.Image):
+                    process_screenshot(img)
+            except Exception:
+                pass
     except KeyboardInterrupt:
         print("\n👋 已退出")
     finally:
