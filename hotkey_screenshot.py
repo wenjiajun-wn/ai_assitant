@@ -41,7 +41,7 @@ def load_user_config():
     config_path = os.path.join(BASE_DIR, "user_config.json")
     defaults = {
         "user_id": "default",
-        "server_url": "http://ai-calendar.xyz:8080",
+        "server_url": "http://ai-calendar.xyz",
         "api_token": ""
     }
     if os.path.exists(config_path):
